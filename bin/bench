@@ -1,0 +1,829 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * filament-bench: build a Laravel app with a Filament panel over a generated
+ * shop, then time it, count what it does, check one version's output against
+ * another's, and test each finding of a performance report.
+ *
+ * Run `bin/bench help` for the commands.
+ */
+
+const ROOT = __DIR__.'/..';
+const TARGETS = ROOT.'/targets';
+const RESULTS = ROOT.'/results';
+const FILAMENT_PACKAGES = ['actions', 'forms', 'infolists', 'notifications', 'panels' => 'filament', 'query-builder', 'schemas', 'support', 'tables', 'widgets', 'spatie-laravel-tags-plugin'];
+
+const HELP = <<<'TXT'
+filament-bench
+
+  bin/bench setup <target> [--filament=5.11.4] [--src=/path/to/filament] [--patch=fix.patch] [--laravel=13.*]
+                           [--size=small] [--seed=1001] [--no-optimize]
+      Build an app in targets/<target>: laravel/laravel, filament/filament at --filament (any Composer
+      constraint, default the latest 5.x), the bench panel and its shop on top. --src copies a local
+      filamentphp/filament checkout's packages over the installed ones (see `sync`); --patch applies a patch
+      to vendor/filament (paths as in the monorepo: packages/tables/src/...). --patch can be repeated.
+      The app is optimised as a production deploy is (`artisan optimize` and `filament:optimize`) unless
+      --no-optimize.
+
+  bin/bench sync <target>
+      Copy the --src checkout over the installed packages again, after you've changed it.
+
+  bin/bench generate <target> [--size=micro|small|medium|large] [--seed=1001] [--customers=N --orders=N ...]
+      Write the shop again at another size. Every target you compare needs the same data.
+
+  bin/bench run <target> [--r=10] [--only=dashboard,customers_index] [--skip=...] [--disk-latency=MS] [--out=file.json]
+      Time every scenario, each request in a fresh PHP process (like PHP-FPM): panel pages, and Livewire
+      round trips (search, sort, paging, live fields, widget and notification polls). Each sample also
+      records the queries, the storage round trips and the models hydrated.
+
+  bin/bench compare <a> <b> [--rounds=3] [--r=10] [--only=...] [--skip=...]
+      Run both targets in alternating order for some rounds and print the difference.
+
+  bin/bench check <a> <b>
+      Render every page and Livewire round trip in both targets and report any difference in the HTML,
+      and in the queries each one ran.
+
+  bin/bench findings <target> [<other>] [--only=#2,#4,3.1-c] [--disk-latency=MS]
+      Test each finding of the report (findings/report.md): measure what the finding says costs, say whether
+      the problem shows on this target, and with two targets, how the second compares with the first.
+
+  bin/bench profile <target> <scenario> [--top=30] [--keep] [--callees=Name]
+      Profile one scenario (a page or a Livewire scenario) with Xdebug and print where the time goes.
+
+  bin/bench list
+      The targets you have and the scenarios they can run.
+
+Every command also takes:
+  --memory-limit=512M   run every PHP process under this limit (8G otherwise)
+  --timeout=900         seconds any one bench process may run before it is stopped and the run fails
+
+Environment: BENCH_PHP (PHP binary, default "php").
+
+TXT;
+
+$argv = $_SERVER['argv'];
+array_shift($argv);
+$command = array_shift($argv) ?? 'help';
+[$args, $opts] = parse_args($argv);
+isset($opts['memory-limit']) && putenv('BENCH_MEMORY_LIMIT='.$opts['memory-limit']);
+isset($opts['timeout']) && putenv('BENCH_TIMEOUT='.(int) $opts['timeout']);
+isset($opts['disk-latency']) && putenv('BENCH_DISK_LATENCY_MS='.(float) $opts['disk-latency']);
+
+register_shutdown_function(function () {
+    foreach (array_keys($GLOBALS['fixtures'] ?? []) as $dir) {
+        try {
+            is_dir($dir) && restore_fixture($dir);
+        } catch (Throwable $e) {
+            fwrite(STDERR, "bench: {$e->getMessage()}\n");
+        }
+    }
+});
+
+try {
+    match ($command) {
+        'setup' => cmd_setup($args, $opts),
+        'sync' => cmd_sync($args),
+        'generate' => cmd_generate($args, $opts),
+        'run' => cmd_run($args, $opts),
+        'compare' => cmd_compare($args, $opts),
+        'check' => cmd_check($args, $opts),
+        'findings' => cmd_findings($args, $opts),
+        'profile' => cmd_profile($args, $opts),
+        'list' => cmd_list(),
+        'help', '--help', '-h' => print (HELP),
+        default => fail("unknown command \"$command\" (try: bin/bench help)"),
+    };
+} catch (BenchError $e) {
+    fwrite(STDERR, "bench: {$e->getMessage()}\n");
+    exit(1);
+}
+
+// ===================================================================== setup
+
+function cmd_setup(array $args, array $opts): void
+{
+    $name = $args[0] ?? fail('setup needs a target name');
+    preg_match('/^[a-z0-9][a-z0-9._-]*$/i', $name) || fail('target names are letters, numbers, dots, dashes');
+    $dir = TARGETS."/$name";
+    is_dir($dir) && fail("target $name already exists (delete targets/$name to rebuild it)");
+    @mkdir(TARGETS, 0777, true);
+
+    $filament = $opts['filament'] ?? '^5.0';
+    say('creating laravel/laravel'.(isset($opts['laravel']) ? ":{$opts['laravel']}" : ''));
+    composer(['create-project', 'laravel/laravel'.(isset($opts['laravel']) ? ":{$opts['laravel']}" : ''), $dir, '--no-install', '--no-scripts', '--no-interaction', '--quiet']);
+    // dev tools that hook into requests would skew the timings
+    composer(['remove', '--dev', '--no-update', '--no-interaction', '--quiet', 'laravel/pail', 'laravel/sail', 'laravel/pint', 'nunomaduro/collision', 'laravel/boost'], $dir, false);
+    composer(['require', '--no-update', '--no-interaction', '--quiet', "filament/filament:$filament", "filament/spatie-laravel-tags-plugin:$filament"], $dir);
+    say('installing packages');
+    composer(['update', '--no-interaction', '--prefer-dist', '--quiet'], $dir);
+
+    say('adding the bench panel');
+    rcopy(ROOT.'/app', $dir);
+    file_put_contents("$dir/bootstrap/providers.php", "<?php\n\nreturn [\n    App\\Providers\\AppServiceProvider::class,\n    App\\Providers\\BenchServiceProvider::class,\n    App\\Providers\\Filament\\AdminPanelProvider::class,\n];\n");
+    // beside Laravel's own (users, cache, jobs): the tables Filament's imports, exports and notifications use
+    sh([...php($dir, false), 'artisan', 'vendor:publish', '--tag=filament-actions-migrations', '--no-interaction', '--quiet'], $dir);
+    sh([...php($dir, false), 'artisan', 'make:notifications-table', '--no-interaction', '--quiet'], $dir);
+    sh([...php($dir, false), 'artisan', 'filament:assets', '--no-interaction', '--quiet'], $dir);
+
+    $target = ['name' => $name, 'filament' => $filament, 'src' => null, 'patches' => [], 'optimize' => ! isset($opts['no-optimize'])];
+    if (isset($opts['src'])) {
+        $target['src'] = realpath($opts['src']) ?: fail("--src {$opts['src']} doesn't exist");
+    }
+    save_target($dir, $target);
+    if ($target['src']) {
+        sync_src($dir, $target);
+    }
+    foreach ((array) ($opts['patch'] ?? []) as $patch) {
+        $patch = realpath($patch) ?: fail("patch $patch doesn't exist");
+        say('applying '.basename($patch));
+        apply_patch($dir, $patch);
+        $target['patches'][] = $patch;
+    }
+    save_target($dir, $target);
+
+    cmd_generate([$name], array_intersect_key($opts, array_flip(['size', 'seed', 'countries', 'categories', 'customers', 'products', 'orders', 'tags', 'notifications'])));
+    say("ready: $name is filament/filament ".target_version($dir));
+}
+
+/** A patch in the monorepo's layout (packages/<package>/...) applied to the split packages in vendor/filament. */
+function apply_patch(string $dir, string $patch): void
+{
+    $text = file_get_contents($patch);
+    foreach (FILAMENT_PACKAGES as $package => $vendor) {
+        $package = is_int($package) ? $vendor : $package;
+        $text = str_replace(["a/packages/$package/", "b/packages/$package/"], ["a/$vendor/", "b/$vendor/"], $text);
+    }
+    $tmp = tempnam(sys_get_temp_dir(), 'bench-patch');
+    file_put_contents($tmp, $text);
+    try {
+        sh(['patch', '-p1', '--forward', '--silent', '-i', $tmp], "$dir/vendor/filament");
+    } finally {
+        unlink($tmp);
+    }
+    after_code_change($dir);
+}
+
+function cmd_sync(array $args): void
+{
+    $dir = target_dir($args[0] ?? fail('sync needs a target name'));
+    $target = load_target($dir);
+    $target['src'] || fail("{$target['name']} wasn't set up with --src");
+    sync_src($dir, $target);
+}
+
+/** Copy a filamentphp/filament checkout's packages over the installed ones: code, views, translations, built assets. */
+function sync_src(string $dir, array $target): void
+{
+    $src = $target['src'];
+    is_dir("$src/packages/support/src") || fail("$src doesn't look like a filamentphp/filament checkout");
+    say("copying $src");
+    foreach (FILAMENT_PACKAGES as $package => $vendor) {
+        $package = is_int($package) ? $vendor : $package;
+        foreach (['src', 'resources', 'config', 'database', 'routes', 'stubs', 'dist'] as $path) {
+            if (is_dir("$src/packages/$package/$path") && is_dir("$dir/vendor/filament/$vendor")) {
+                sh(['rsync', '-a', '--delete', '--exclude=node_modules', "$src/packages/$package/$path/", "$dir/vendor/filament/$vendor/$path/"]);
+            }
+        }
+    }
+    after_code_change($dir);
+}
+
+/** After the package code changed: published assets, caches and compiled code all follow it. */
+function after_code_change(string $dir): void
+{
+    rrmdir("$dir/storage/framework/opcache");
+    sh([...php($dir, false), 'artisan', 'package:discover', '--quiet'], $dir, false);
+    sh([...php($dir, false), 'artisan', 'filament:assets', '--quiet'], $dir, false);
+    optimize($dir);
+}
+
+/** What a production deploy runs: Laravel's caches and Filament's component and icon caches. */
+function optimize(string $dir): void
+{
+    sh([...php($dir, false), 'artisan', 'optimize:clear', '--quiet'], $dir, false);
+    sh([...php($dir, false), 'artisan', 'filament:optimize-clear', '--quiet'], $dir, false);
+    rrmdir("$dir/storage/framework/opcache");
+    if (is_file("$dir/bench/target.json") && (load_target($dir)['optimize'] ?? true)) {
+        sh([...php($dir, false), 'artisan', 'optimize', '--quiet'], $dir);
+        sh([...php($dir, false), 'artisan', 'filament:optimize', '--quiet'], $dir);
+    }
+}
+
+/** Targets run their own copy of the bench scripts and panel. Copy this checkout's over them, so an old target runs today's bench. */
+function sync_app(string $dir): void
+{
+    $changed = false;
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator(ROOT.'/app', FilesystemIterator::SKIP_DOTS)) as $file) {
+        $to = $dir.substr($file->getPathname(), strlen(ROOT.'/app'));
+        if (! is_file($to) || md5_file($to) !== md5_file($file->getPathname())) {
+            @mkdir(dirname($to), 0777, true);
+            copy($file->getPathname(), $to);
+            $changed = $changed || ! str_starts_with(substr($file->getPathname(), strlen(ROOT.'/app')), '/bench/');
+        }
+    }
+    // the panel's code changed, so the cached config, routes and components may describe the old one
+    if ($changed && is_file("$dir/bench/target.json")) {
+        optimize($dir);
+    }
+}
+
+function cmd_generate(array $args, array $opts): void
+{
+    $dir = target_dir($args[0] ?? fail('generate needs a target name'));
+    $flags = [];
+    foreach (['size', 'seed', 'countries', 'categories', 'customers', 'products', 'orders', 'tags', 'notifications'] as $k) {
+        isset($opts[$k]) && $flags[] = "--$k={$opts[$k]}";
+    }
+    // the generator writes the manifest last, so one that fails leaves a target with no data to speak of
+    @unlink("$dir/bench/manifest.json");
+    @unlink("$dir/bench/pristine.sqlite");
+    @unlink("$dir/database/database.sqlite");
+    touch("$dir/database/database.sqlite");
+    sh([...php($dir, false), 'artisan', 'migrate', '--force', '--no-interaction', '--quiet'], $dir);
+    say('generating '.($opts['size'] ?? 'small'));
+    sh([...php($dir), 'bench/generate.php', ...$flags], $dir);
+    copy("$dir/database/database.sqlite", "$dir/bench/pristine.sqlite");
+    rrmdir("$dir/storage/framework/bench");
+    optimize($dir);
+}
+
+/** Put the database back as generated if anything changed it. True when something had. */
+function restore_fixture(string $dir): bool
+{
+    $pristine = "$dir/bench/pristine.sqlite";
+    is_file($pristine) || fail(basename($dir).' has no data yet (bin/bench generate '.basename($dir).')');
+    foreach (['-wal', '-shm', '-journal'] as $suffix) {
+        @unlink("$dir/database/database.sqlite$suffix");
+    }
+    if (is_file("$dir/database/database.sqlite") && filesize($pristine) === filesize("$dir/database/database.sqlite") && sha1_file($pristine) === sha1_file("$dir/database/database.sqlite")) {
+        return false;
+    }
+    copy($pristine, "$dir/database/database.sqlite");
+
+    return true;
+}
+
+/** A target whose data a command is about to read: as generated now, and again when the command ends, however it ends. */
+function fixture_dir(string $name): string
+{
+    $dir = target_dir($name);
+    if (restore_fixture($dir)) {
+        say(basename($dir).': the database had been changed since it was generated (a run that was stopped?); put back');
+    }
+    $GLOBALS['fixtures'][$dir] = true;
+
+    return $dir;
+}
+
+function cmd_list(): void
+{
+    foreach (glob(TARGETS.'/*', GLOB_ONLYDIR) as $dir) {
+        $t = load_target($dir);
+        $m = is_file("$dir/bench/manifest.json") ? manifest($dir) : null;
+        printf("%-16s filament/filament %-10s %s%s%s  data: %s\n", $t['name'], target_version($dir), $t['src'] ? "src {$t['src']} " : '',
+            $t['patches'] ? count($t['patches']).' patch(es) ' : '', ($t['optimize'] ?? true) ? '' : 'not optimised ', $m ? "{$m['config']['size']} (seed {$m['config']['seed']})" : 'none');
+    }
+    if (isset($m)) {
+        echo "\npages: ".implode(', ', array_keys($m['pages']))."\nlivewire: ".implode(', ', array_keys($m['livewire']))."\n";
+    }
+}
+
+// ======================================================================= run
+
+function cmd_run(array $args, array $opts): void
+{
+    warn_if_busy();
+    $dir = fixture_dir($args[0] ?? fail('run needs a target name'));
+    $result = run_target($dir, $opts);
+    print_table(['scenario', 'median ms', 'min', 'max', 'boot ms', 'peak MB', 'queries', 'disk', 'KB'], array_map(
+        fn ($name, $s) => [$name, ms(median($s['ms'])), ms(min($s['ms'])), ms(max($s['ms'])), ms(median($s['boot_ms'])), sprintf('%.1f', max($s['peak_mem_mb'])),
+            (string) $s['queries'][0], (string) array_sum($s['disk'][0] ?? []), sprintf('%.1f', $s['bytes'][0] / 1024)],
+        array_keys($result['scenarios']), $result['scenarios']
+    ));
+    $out = $opts['out'] ?? RESULTS.'/'.basename($dir).'-'.date('Ymd-His').'.json';
+    @mkdir(dirname($out), 0777, true);
+    file_put_contents($out, json_encode($result, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+    say("wrote $out");
+}
+
+/** The scenarios this run asks for, page and Livewire, in manifest order. */
+function wanted_scenarios(array $m, array $opts): array
+{
+    $only = isset($opts['only']) ? explode(',', $opts['only']) : null;
+    $skip = isset($opts['skip']) ? explode(',', $opts['skip']) : [];
+    $wanted = fn (string $name) => ! in_array($name, $skip) && (! $only || in_array($name, $only));
+
+    return [array_filter($m['pages'], $wanted, ARRAY_FILTER_USE_KEY), array_filter($m['livewire'], $wanted, ARRAY_FILTER_USE_KEY)];
+}
+
+/** Every sample of every scenario for one target. */
+function run_target(string $dir, array $opts, bool $quiet = false): array
+{
+    $m = manifest($dir);
+    $r = (int) ($opts['r'] ?? 10);
+    [$pages, $livewire] = wanted_scenarios($m, $opts);
+    $log = fn (string $s) => $quiet || fwrite(STDERR, $s);
+    $scenarios = [];
+    $add = function (string $name, array $sample) use (&$scenarios) {
+        $sample['load'] = round(sys_getloadavg()[0] ?? 0, 2);
+        foreach (['ms', 'boot_ms', 'peak_mem_mb', 'bytes', 'queries', 'query_ms', 'disk', 'hydrated', 'load'] as $k) {
+            $scenarios[$name][$k][] = $sample[$k] ?? null;
+        }
+    };
+
+    foreach ($pages as [$url, $status, $signedIn]) {
+        page_request($dir, $m, $url, $status, $signedIn);   // compiles views, fills opcache
+    }
+    foreach ($livewire as $name => $_) {
+        livewire_prepare($dir, $m, $name);
+        livewire_request($dir, $m, $name);
+    }
+    // round-robin, so drift in the machine's load spreads over every scenario
+    for ($i = 0; $i < $r; $i++) {
+        foreach ($pages as $name => [$url, $status, $signedIn]) {
+            $add($name, page_request($dir, $m, $url, $status, $signedIn));
+        }
+        foreach ($livewire as $name => $_) {
+            $add($name, livewire_request($dir, $m, $name));
+        }
+        $log('.');
+    }
+    $log("\n");
+
+    return [
+        'target' => load_target($dir),
+        'filament' => target_version($dir),
+        'php' => trim(shell_exec(escapeshellarg(php_binary()).' -r "echo PHP_VERSION;"')),
+        'fixture' => $m['config'],
+        'counts' => $m['counts'],
+        'disk_latency_ms' => (float) getenv('BENCH_DISK_LATENCY_MS'),
+        'r' => $r,
+        'scenarios' => $scenarios,
+    ];
+}
+
+function page_request(string $dir, array $m, string $url, int $status, bool $signedIn, ?string $html = null, array $env = []): array
+{
+    return child($dir, ['bench/request.php', "--url=$url", "--expect=$status", ...($signedIn ? ["--as={$m['user']}"] : []), ...($html ? ["--html=$html"] : [])], true, $env);
+}
+
+function snapshot_file(string $dir, string $name): string
+{
+    @mkdir("$dir/storage/framework/bench", 0777, true);
+
+    return "$dir/storage/framework/bench/$name.snapshot.json";
+}
+
+function livewire_prepare(string $dir, array $m, string $name): void
+{
+    child($dir, ['bench/livewire.php', '--prepare', "--scenario=$name", "--as={$m['user']}", '--snapshot='.snapshot_file($dir, $name)]);
+}
+
+function livewire_request(string $dir, array $m, string $name, ?string $html = null, array $env = []): array
+{
+    return child($dir, ['bench/livewire.php', "--scenario=$name", "--as={$m['user']}", '--snapshot='.snapshot_file($dir, $name), ...($html ? ["--html=$html"] : [])], true, $env);
+}
+
+function cmd_compare(array $args, array $opts): void
+{
+    warn_if_busy();
+    count($args) === 2 || fail('compare needs two target names');
+    [$a, $b] = array_map('fixture_dir', $args);
+    same_fixture($a, $b);
+    $rounds = (int) ($opts['rounds'] ?? 3);
+    $samples = [];
+    for ($round = 0; $round < $rounds; $round++) {
+        foreach ($round % 2 ? [$b, $a] : [$a, $b] as $dir) {
+            fwrite(STDERR, sprintf('round %d/%d %-12s ', $round + 1, $rounds, basename($dir)));
+            foreach (run_target($dir, $opts)['scenarios'] as $name => $s) {
+                foreach ($s as $k => $values) {
+                    $samples[$name][$dir][$k] = [...($samples[$name][$dir][$k] ?? []), ...$values];
+                }
+            }
+        }
+    }
+
+    $rows = [];
+    foreach ($samples as $name => $s) {
+        [$ma, $mb] = [median($s[$a]['ms']), median($s[$b]['ms'])];
+        $noise = 100 * (mad($s[$a]['ms']) / $ma + mad($s[$b]['ms']) / $mb);
+        $diff = 100 * ($mb - $ma) / $ma;
+        [$qa, $qb] = [median($s[$a]['queries']), median($s[$b]['queries'])];
+        [$da, $db] = [array_sum($s[$a]['disk'][0] ?? []), array_sum($s[$b]['disk'][0] ?? [])];
+        [$pa, $pb] = [max($s[$a]['peak_mem_mb']), max($s[$b]['peak_mem_mb'])];
+        [$ka, $kb] = [median($s[$a]['bytes']) / 1024, median($s[$b]['bytes']) / 1024];
+        $rows[] = [$name, ms($ma), ms($mb), sprintf('%+.1f%%', $diff), sprintf('±%.1f%%', $noise), abs($diff) > max(2.0, 2 * $noise) ? ($diff < 0 ? 'faster' : 'SLOWER') : 'same',
+            $qa == $qb ? (string) $qa : "$qa → $qb", $da === $db ? (string) $da : "$da → $db", sprintf('%+.1f%%', 100 * ($pb - $pa) / $pa), abs($ka - $kb) < 0.05 ? sprintf('%.1f', $ka) : sprintf('%.1f → %.1f', $ka, $kb)];
+    }
+    echo "\n";
+    print_table(['scenario', basename($a).' ms', basename($b).' ms', 'time', 'noise', '', 'queries', 'disk', 'memory', 'KB'], $rows);
+    echo "\ntime = median of every sample; noise = spread of the samples (median absolute deviation, both targets);\na difference under twice the noise (or under 2%) is reported as \"same\". queries, disk (storage round trips)\nand KB (response size) are per request, and should not vary between samples.\n";
+
+    $out = $opts['out'] ?? RESULTS.'/compare-'.basename($a).'-'.basename($b).'-'.date('Ymd-His').'.json';
+    @mkdir(dirname($out), 0777, true);
+    file_put_contents($out, json_encode(['a' => load_target($a), 'b' => load_target($b), 'rounds' => $rounds, 'fixture' => manifest($a)['config'],
+        'samples' => array_map(fn ($s) => [basename($a) => $s[$a], basename($b) => $s[$b]], $samples)], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+    say("wrote $out");
+}
+
+// ===================================================================== check
+
+function cmd_check(array $args, array $opts): void
+{
+    count($args) === 2 || fail('check needs two target names');
+    [$a, $b] = array_map('fixture_dir', $args);
+    same_fixture($a, $b);
+    $out = RESULTS.'/check';
+    $files = [];
+    foreach ([$a, $b] as $dir) {
+        $m = manifest($dir);
+        [$pages, $livewire] = wanted_scenarios($m, $opts);
+        $to = "$out/".basename($dir);
+        rrmdir($to);
+        @mkdir($to, 0777, true);
+        $queries = [];
+        foreach ($pages as $name => [$url, $status, $signedIn]) {
+            $queries[$name] = page_request($dir, $m, $url, $status, $signedIn, "$to/$name.html")['queries'];
+            $files[$name.'.html'] = true;
+        }
+        foreach ($livewire as $name => $_) {
+            livewire_prepare($dir, $m, $name);
+            $queries[$name] = livewire_request($dir, $m, $name, "$to/$name.livewire.html")['queries'];
+            $files[$name.'.livewire.html'] = true;
+        }
+        file_put_contents("$to/queries.json", json_encode($queries, JSON_PRETTY_PRINT)."\n");
+    }
+    $different = 0;
+    foreach (array_keys($files) as $file) {
+        [$fa, $fb] = ["$out/".basename($a)."/$file", "$out/".basename($b)."/$file"];
+        $same = md5_file($fa) === md5_file($fb);
+        printf("  %-36s %s\n", $file, $same ? 'identical' : 'DIFFERENT');
+        if (! $same) {
+            $different++;
+            echo implode("\n", array_slice(explode("\n", (string) shell_exec('diff -u '.escapeshellarg($fa).' '.escapeshellarg($fb))), 0, 14))."\n";
+        }
+    }
+    [$qa, $qb] = [json_decode(file_get_contents("$out/".basename($a).'/queries.json'), true), json_decode(file_get_contents("$out/".basename($b).'/queries.json'), true)];
+    foreach ($qa as $name => $n) {
+        $n === $qb[$name] || printf("  %-36s %d queries → %d\n", $name, $n, $qb[$name]);
+    }
+    echo $different ? "\n$different file(s) differ; both versions are in results/check/\n" : "\nevery page and Livewire response is identical\n";
+    exit($different ? 1 : 0);
+}
+
+// ================================================================== findings
+
+function cmd_findings(array $args, array $opts): void
+{
+    $dirs = array_map('fixture_dir', $args ?: fail('findings needs a target name (or two, to compare them)'));
+    count($dirs) <= 2 || fail('findings takes one or two targets');
+    count($dirs) === 2 && same_fixture(...$dirs);
+    $results = [];
+    foreach ($dirs as $dir) {
+        say(basename($dir).': testing the findings');
+        $m = manifest($dir);
+        // the probes need pages to have been rendered once (views compiled), and Livewire snapshots
+        foreach ($m['livewire'] as $name => $_) {
+            livewire_prepare($dir, $m, $name);
+        }
+        $flags = isset($opts['only']) ? ['--only='.$opts['only']] : [];
+        // under Xdebug, for its function counts; what it times, it runs in children without
+        $result = child($dir, ['bench/findings.php', ...$flags], false, [], true);
+        isset($result['findings']) || fail('the findings did not finish: '.json_encode($result));
+        $results[basename($dir)] = $result['findings'];
+        restore_fixture($dir);
+    }
+    $names = array_keys($results);
+    $rows = [];
+    foreach ($results[$names[0]] as $id => $f) {
+        $other = isset($names[1]) ? ($results[$names[1]][$id] ?? null) : null;
+        $rows[] = [$id, mb_strimwidth($f['title'], 0, 52, '…'), $f['shows'] === null ? 'n/a' : ($f['shows'] ? 'SHOWS' : 'no'), mb_strimwidth($f['summary'], 0, 70, '…'),
+            ...($other ? [$other['shows'] === null ? 'n/a' : ($other['shows'] ? 'SHOWS' : 'no'), mb_strimwidth($other['summary'], 0, 70, '…')] : [])];
+    }
+    print_table(['id', 'finding', $names[0], 'measured', ...(isset($names[1]) ? [$names[1], 'measured'] : [])], $rows);
+    echo "\nSHOWS: the cost the report describes is there on this target. no: it isn't (fixed, or the report was wrong).\nn/a: measured, but there is nothing to decide (see the detail). Every measurement is in the JSON.\n";
+    $out = RESULTS.'/findings-'.implode('-', $names).'-'.date('Ymd-His').'.json';
+    @mkdir(dirname($out), 0777, true);
+    file_put_contents($out, json_encode($results, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)."\n");
+    say("wrote $out");
+}
+
+// =================================================================== profile
+
+function cmd_profile(array $args, array $opts): void
+{
+    $dir = fixture_dir($args[0] ?? fail('profile needs a target and a scenario'));
+    $scenario = $args[1] ?? fail('profile needs a scenario: a page or a Livewire scenario');
+    $m = manifest($dir);
+    if (isset($m['pages'][$scenario])) {
+        [$url, $status, $signedIn] = $m['pages'][$scenario];
+        page_request($dir, $m, $url, $status, $signedIn);
+        $script = ['bench/request.php', "--url=$url", ...($signedIn ? ["--as={$m['user']}"] : [])];
+    } elseif (isset($m['livewire'][$scenario])) {
+        livewire_prepare($dir, $m, $scenario);
+        livewire_request($dir, $m, $scenario);
+        $script = ['bench/livewire.php', "--scenario=$scenario", "--as={$m['user']}", '--snapshot='.snapshot_file($dir, $scenario)];
+    } else {
+        fail("no scenario \"$scenario\" (try: bin/bench list)");
+    }
+
+    $out = RESULTS.'/profiles';
+    @mkdir($out, 0777, true);
+    $name = basename($dir)."-$scenario";
+    @unlink("$out/$name.cachegrind.gz");
+    @unlink("$out/$name.cachegrind.gz.pickle");
+    say('profiling with Xdebug (several times slower than a normal run)');
+    sh([...php($dir, false, true), '-d', 'xdebug.mode=profile', '-d', 'xdebug.start_with_request=yes', '-d', "xdebug.output_dir=$out",
+        '-d', "xdebug.profiler_output_name=$name.cachegrind", '-d', 'xdebug.use_compression=1', ...$script], $dir);
+    is_file("$out/$name.cachegrind.gz") || fail('Xdebug wrote no profile');
+
+    $summary = ['python3', ROOT.'/tools/cachegrind_top.py', "$out/$name.cachegrind.gz", '--top', (string) ($opts['top'] ?? 30)];
+    isset($opts['callees']) && array_push($summary, '--callees', $opts['callees']);
+    passthru(implode(' ', array_map('escapeshellarg', $summary)).' | tee '.escapeshellarg("$out/$name.txt"));
+    isset($opts['keep']) || unlink("$out/$name.cachegrind.gz");
+    say("summary in results/profiles/$name.txt".(isset($opts['keep']) ? ", raw profile in results/profiles/$name.cachegrind.gz" : ''));
+}
+
+// =================================================================== helpers
+
+final class BenchError extends RuntimeException {}
+
+function fail(string $message): never
+{
+    throw new BenchError($message);
+}
+
+function say(string $message): void
+{
+    fwrite(STDERR, "\033[1m==> $message\033[0m\n");
+}
+
+function parse_args(array $argv): array
+{
+    $args = $opts = [];
+    foreach ($argv as $arg) {
+        if (preg_match('/^--([a-z0-9-]+)(?:=(.*))?$/s', $arg, $m)) {
+            $value = $m[2] ?? true;
+            $opts[$m[1]] = isset($opts[$m[1]]) ? [...(array) $opts[$m[1]], $value] : $value;
+        } else {
+            $args[] = $arg;
+        }
+    }
+
+    return [$args, $opts];
+}
+
+function php_binary(): string
+{
+    return getenv('BENCH_PHP') ?: 'php';
+}
+
+/**
+ * The extensions the app needs, loaded on top of `php -n`, so nothing in this
+ * machine's php.ini (Xdebug above all, which Debian and Ubuntu load by
+ * default) can skew a run. Built-in ones are skipped.
+ */
+function extension_args(bool $xdebug = false): array
+{
+    static $base;
+    if ($base === null) {
+        $php = escapeshellarg(php_binary());
+        $loaded = array_map('strtolower', explode("\n", trim((string) shell_exec("$php -n -r 'echo implode(\"\\n\", get_loaded_extensions());'"))));
+        $extDir = trim((string) shell_exec("$php -r 'echo ini_get(\"extension_dir\");'"));
+        $base = [];
+        foreach (['ctype', 'iconv', 'mbstring', 'tokenizer', 'fileinfo', 'xml', 'dom', 'simplexml', 'xmlreader', 'xmlwriter', 'curl', 'intl', 'pdo', 'pdo_sqlite', 'sqlite3', 'bcmath', 'zip', 'posix', 'gd', 'phar', 'filter', 'session'] as $ext) {
+            if (! in_array($ext, $loaded) && is_file("$extDir/$ext.so")) {
+                array_push($base, '-d', "extension=$ext");
+            }
+        }
+        if (! in_array('zend opcache', $loaded) && is_file("$extDir/opcache.so")) {
+            array_push($base, '-d', 'zend_extension=opcache');
+        }
+        $base = ['-n', ...$base];
+        $GLOBALS['xdebug_so'] = is_file("$extDir/xdebug.so") ? "$extDir/xdebug.so" : null;
+    }
+    if ($xdebug) {
+        $so = getenv('XDEBUG_SO') ?: ($GLOBALS['xdebug_so'] ?? null);
+        $so || fail('Xdebug not found: install it, or set XDEBUG_SO=/path/to/xdebug.so');
+
+        return [...$base, '-d', "zend_extension=$so"];
+    }
+
+    return $base;
+}
+
+/** The PHP command every bench process runs under: production-like, the same for every target. */
+function php(string $dir, bool $fileCache = true, bool $xdebug = false): array
+{
+    $args = [php_binary(), ...extension_args($xdebug),
+        '-d', 'memory_limit='.(getenv('BENCH_MEMORY_LIMIT') ?: '8G'), '-d', 'display_errors=stderr', '-d', 'pcre.jit=1', '-d', 'date.timezone=UTC',
+        '-d', 'opcache.enable_cli=1', '-d', 'opcache.jit=disable', '-d', 'opcache.memory_consumption=256', '-d', 'opcache.max_accelerated_files=30000',
+        '-d', 'opcache.validate_timestamps=1', '-d', 'realpath_cache_size=4096K'];
+    $xdebug && array_push($args, '-d', 'xdebug.mode=develop');
+    if ($fileCache && ! $xdebug) {
+        // each process gets compiled code from disk, the way an FPM worker gets it from shared memory
+        @mkdir("$dir/storage/framework/opcache", 0777, true);
+        array_push($args, '-d', "opcache.file_cache=$dir/storage/framework/opcache");
+    }
+
+    return $args;
+}
+
+function composer(array $args, ?string $cwd = null, bool $strict = true): void
+{
+    // Composer under the machine's own PHP, without Xdebug slowing it down
+    putenv('XDEBUG_MODE=off');
+    sh(['composer', ...$args], $cwd, $strict);
+}
+
+/**
+ * Run a bench script in its own PHP process and decode the JSON line it prints.
+ * Every child has a deadline: a bench that hangs has told nobody anything.
+ */
+function child(string $dir, array $script, bool $strict = true, array $env = [], bool $xdebug = false): array
+{
+    $env = [...getenv(), 'BENCH_CHILD' => json_encode(php($dir)), 'BENCH_CHILD_XDEBUG' => json_encode(php($dir, false, true)), ...$env];
+    [$code, $out, $err, $timedOut] = run_process([...php($dir, true, $xdebug), ...$script], $dir, $env, true);
+    $lines = array_filter(explode("\n", trim($out)));
+    $data = json_decode((string) end($lines), true);
+    if ($timedOut) {
+        restore_fixture($dir);
+        $message = implode(' ', $script).' in '.basename($dir).' was still running after '.bench_timeout().' s and was stopped. (BENCH_TIMEOUT sets the limit.)';
+        $strict && fail($message);
+
+        return ['exit' => 124, 'timed_out' => true, 'error' => $message];
+    }
+    if ($strict && ($code !== 0 || ! is_array($data))) {
+        $said = trim(substr($err, 0, 1500).' '.substr($out, -600));
+        $limit = getenv('BENCH_MEMORY_LIMIT');
+        fail(implode(' ', $script).' failed in '.basename($dir)." (exit $code): ".($said !== '' ? $said : 'it printed nothing'.($limit ? ", which is what PHP does when it runs out of memory before it can report it (this run has --memory-limit=$limit)" : '')));
+    }
+    $GLOBALS['child_stderr'] = $err;
+
+    return is_array($data) ? $data : ['exit' => $code, 'error' => trim(substr($err, 0, 1500).' '.substr($out, -600))];
+}
+
+function sh(array $command, ?string $cwd = null, bool $strict = true): void
+{
+    [$code, , , $timedOut] = run_process($command, $cwd, null, false);
+    $timedOut && fail(implode(' ', $command).' was still running after '.bench_timeout().' s and was stopped (BENCH_TIMEOUT sets the limit)');
+    if ($strict && $code !== 0) {
+        fail(implode(' ', $command)." failed (exit $code)");
+    }
+}
+
+/** Timings taken while the machine is doing something else can't tell a 5% change from nothing. */
+function warn_if_busy(): void
+{
+    $load = sys_getloadavg()[0] ?? 0;
+    $cores = max(1, (int) trim((string) shell_exec('getconf _NPROCESSORS_ONLN 2>/dev/null')));
+    if ($load > max(2, $cores / 4)) {
+        say(sprintf('this machine is busy (load %.1f on %d cores): expect noisy timings, and don\'t trust a small difference', $load, $cores));
+    }
+}
+
+function bench_timeout(): int
+{
+    return (int) (getenv('BENCH_TIMEOUT') ?: 900);
+}
+
+/** Run a command to the end or to the deadline: [exit code, stdout, stderr, whether it was stopped]. */
+function run_process(array $command, ?string $cwd, ?array $env, bool $capture): array
+{
+    $proc = proc_open($command, $capture ? [1 => ['pipe', 'w'], 2 => ['pipe', 'w']] : [1 => STDERR, 2 => STDERR], $pipes, $cwd, $env);
+    is_resource($proc) || fail("couldn't start ".implode(' ', $command));
+    array_map(fn ($pipe) => stream_set_blocking($pipe, false), $pipes);
+    [$out, $err, $deadline, $timedOut] = ['', '', hrtime(true) + bench_timeout() * 1e9, false];
+    while (true) {
+        if ($capture) {
+            $out .= stream_get_contents($pipes[1]);
+            $err .= stream_get_contents($pipes[2]);
+        }
+        $status = proc_get_status($proc);
+        if (! $status['running']) {
+            break;
+        }
+        if (hrtime(true) > $deadline) {
+            $timedOut = true;
+            kill_tree($status['pid']);
+            break;
+        }
+        usleep(5000);
+    }
+    if ($capture) {
+        $out .= stream_get_contents($pipes[1]);
+        $err .= stream_get_contents($pipes[2]);
+    }
+    $code = $status['running'] ? proc_close($proc) : $status['exitcode'];
+
+    return [$timedOut ? 124 : $code, $out, $err, $timedOut];
+}
+
+/** Stop a process and everything it started. */
+function kill_tree(int $pid): void
+{
+    $all = [$pid];
+    for ($i = 0; $i < count($all); $i++) {
+        exec('kill -STOP '.$all[$i].' 2>/dev/null');
+        $children = [];
+        exec('pgrep -P '.$all[$i].' 2>/dev/null', $children);
+        array_push($all, ...array_map('intval', $children));
+    }
+    exec('kill -9 '.implode(' ', $all).' 2>/dev/null');
+}
+
+function target_dir(string $name): string
+{
+    $dir = TARGETS."/$name";
+    is_file("$dir/bench/target.json") || is_dir("$dir/vendor/filament") || fail("no target \"$name\" (bin/bench setup $name)");
+    sync_app($dir);
+
+    return $dir;
+}
+
+function load_target(string $dir): array
+{
+    return json_decode(file_get_contents("$dir/bench/target.json"), true);
+}
+
+function save_target(string $dir, array $target): void
+{
+    file_put_contents("$dir/bench/target.json", json_encode($target, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+}
+
+function target_version(string $dir): string
+{
+    $installed = json_decode(file_get_contents("$dir/vendor/composer/installed.json"), true);
+    foreach ($installed['packages'] ?? $installed as $package) {
+        if ($package['name'] === 'filament/filament') {
+            return ltrim($package['version'], 'v');
+        }
+    }
+
+    return '?';
+}
+
+function manifest(string $dir): array
+{
+    is_file("$dir/bench/manifest.json") || fail(basename($dir).' has no data yet (bin/bench generate '.basename($dir).')');
+
+    return json_decode(file_get_contents("$dir/bench/manifest.json"), true);
+}
+
+function same_fixture(string $a, string $b): void
+{
+    [$ma, $mb] = [manifest($a), manifest($b)];
+    ($ma['config'] == $mb['config'] && $ma['fingerprint'] === $mb['fingerprint']) || fail(sprintf('%s and %s hold different data; run `bin/bench generate` on both with the same --size and --seed', basename($a), basename($b)));
+}
+
+function median(array $xs): float
+{
+    sort($xs);
+    $n = count($xs);
+
+    return $n % 2 ? $xs[intdiv($n, 2)] : ($xs[$n / 2 - 1] + $xs[$n / 2]) / 2;
+}
+
+/** Median absolute deviation: how far a typical sample sits from the median. */
+function mad(array $xs): float
+{
+    $m = median($xs);
+
+    return median(array_map(fn ($x) => abs($x - $m), $xs));
+}
+
+function ms(float $ms): string
+{
+    return $ms >= 1000 ? number_format($ms, 0) : sprintf($ms < 1 ? '%.2f' : '%.1f', $ms);
+}
+
+function print_table(array $head, array $rows): void
+{
+    $widths = array_map(fn ($i) => max(array_map(fn ($row) => mb_strlen((string) ($row[$i] ?? '')), [$head, ...$rows])), array_keys($head));
+    foreach ([$head, ...$rows] as $n => $row) {
+        echo rtrim(implode('  ', array_map(fn ($i) => $i <= 1 ? mb_str_pad((string) ($row[$i] ?? ''), $widths[$i]) : mb_str_pad((string) ($row[$i] ?? ''), $widths[$i], ' ', STR_PAD_LEFT), array_keys($head))))."\n";
+        if ($n === 0) {
+            echo implode('  ', array_map(fn ($w) => str_repeat('-', $w), $widths))."\n";
+        }
+    }
+}
+
+function rcopy(string $from, string $to): void
+{
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($from, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST) as $item) {
+        $dest = $to.substr($item->getPathname(), strlen($from));
+        $item->isDir() ? @mkdir($dest, 0777, true) : copy($item->getPathname(), $dest);
+    }
+}
+
+function rrmdir(string $dir): void
+{
+    if (! is_dir($dir)) {
+        return;
+    }
+    foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS), RecursiveIteratorIterator::CHILD_FIRST) as $f) {
+        $f->isDir() && ! $f->isLink() ? rmdir($f->getPathname()) : unlink($f->getPathname());
+    }
+    rmdir($dir);
+}

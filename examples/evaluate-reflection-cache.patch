@@ -1,0 +1,50 @@
+diff --git a/packages/support/src/Concerns/EvaluatesClosures.php b/packages/support/src/Concerns/EvaluatesClosures.php
+index 0c5d0b2..fa8df6b 100644
+--- a/packages/support/src/Concerns/EvaluatesClosures.php
++++ b/packages/support/src/Concerns/EvaluatesClosures.php
+@@ -8,6 +8,7 @@ use Illuminate\Database\Eloquent\Model;
+ use ReflectionFunction;
+ use ReflectionNamedType;
+ use ReflectionParameter;
++use WeakMap;
+ 
+ trait EvaluatesClosures
+ {
+@@ -29,13 +30,27 @@ trait EvaluatesClosures
+ 
+         $dependencies = [];
+ 
+-        foreach ((new ReflectionFunction($value))->getParameters() as $parameter) {
++        foreach (static::getClosureParameters($value) as $parameter) {
+             $dependencies[] = $this->resolveClosureDependencyForEvaluation($parameter, $namedInjections, $typedInjections);
+         }
+ 
+         return $value(...$dependencies);
+     }
+ 
++    /**
++     * A closure's parameters, reflected once for as long as the closure lives.
++     *
++     * @return array<ReflectionParameter>
++     */
++    protected static function getClosureParameters(Closure $closure): array
++    {
++        /** @var WeakMap<Closure, array<ReflectionParameter>> | null $cache */
++        static $cache = null;
++        $cache ??= new WeakMap;
++
++        return $cache[$closure] ??= (new ReflectionFunction($closure))->getParameters();
++    }
++
+     /**
+      * @param  array<string, mixed>  $namedInjections
+      * @param  array<string, mixed>  $typedInjections
+@@ -108,7 +123,7 @@ trait EvaluatesClosures
+             return false;
+         }
+ 
+-        foreach ((new ReflectionFunction($value))->getParameters() as $parameter) {
++        foreach (static::getClosureParameters($value) as $parameter) {
+             if ($parameter->getName() === $parameterName) {
+                 return true;
+             }

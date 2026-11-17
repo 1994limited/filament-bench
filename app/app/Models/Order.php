@@ -1,0 +1,28 @@
+<?php
+
+namespace App\Models;
+
+use App\Enums\OrderStatus;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+
+class Order extends Model
+{
+    protected $guarded = [];
+
+    protected function casts(): array
+    {
+        return ['status' => OrderStatus::class, 'placed_at' => 'datetime', 'shipped_at' => 'datetime'];
+    }
+
+    public function customer(): BelongsTo
+    {
+        return $this->belongsTo(Customer::class);
+    }
+
+    public function items(): HasMany
+    {
+        return $this->hasMany(OrderItem::class)->orderBy('sort');
+    }
+}
