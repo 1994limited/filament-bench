@@ -65,7 +65,9 @@ class OrderResource extends Resource
             ]),
             Section::make('Items')->columnSpanFull()->schema([
                 Repeater::make('items')->relationship()->orderColumn('sort')->columns(3)->schema([
-                    Select::make('product_id')->relationship('product', 'name')->required()->disableOptionsWhenSelectedInSiblingRepeaterItems(! Variant::on('no_sibling_disable')),
+                    Select::make('product_id')->relationship('product', 'name')->required()
+                        // the method takes no argument, so the variant has to skip the call
+                        ->when(! Variant::on('no_sibling_disable'), fn (Select $select): Select => $select->disableOptionsWhenSelectedInSiblingRepeaterItems()),
                     TextInput::make('qty')->numeric()->required()->live(onBlur: true),
                     TextInput::make('unit_price')->numeric()->required(),
                 ]),

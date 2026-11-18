@@ -52,7 +52,7 @@ It reports **SHOWS** when the cost is there, and **no** when it isn't.
 | 12 | Clearing schema caches builds the tree first | Clearing 10 sections builds 40 schemas | SHOWS |
 | 13 | A relationship Select queries twice when it fills | 1 query, searchable or not. The double query needs `preload()` or `multiple()` | no |
 | 14 | Each Repeater item queries the Select's options again | 20 identical option queries for 20 items | SHOWS |
-| 15 | Disabling options picked in sibling items is quadratic | No measurable cost at 20 items × 300 options | no |
+| 15 | Disabling options picked in sibling items is quadratic | 456 ms with it, 137 ms without, for 20 items × 300 options: about 70% of the order edit page and of each live update | SHOWS |
 | 16 | Postgres text search can't use an index | Equals becomes `lower("number"::text) like ?`. On SQLite the same LIKE scans the table, where `=` uses the index | SHOWS |
 | 17 | Date filters wrap the column | "Is after" scans the table (3.75 ms); a range uses the index (0.05 ms) | SHOWS |
 | 18 | Echo and Pusher load on every page | `echo.js` (92 KB, 24 KB gzipped) on every page with broadcasting off | SHOWS |
@@ -91,7 +91,6 @@ It reports **SHOWS** when the cost is there, and **no** when it isn't.
     - The second NavigationManager only appears on tenant-domain panels.
     - Livewire updates don't rebuild the sidebar.
 - **#4**'s suggested fix (`toBase()` with a minimal select) can't work, because the selectable check needs full models. The count has to wait until someone selects all.
-- **#15** costs nothing measurable at a realistic size.
 - **#19**: the "lazy-import path" the report points to doesn't exist. Lazy languages need code splitting in the build.
 - **#9**: the cost is real, but the ordering is stable, so rows are only skipped or duplicated if data changes during the export.
 - **Smaller corrections:**
